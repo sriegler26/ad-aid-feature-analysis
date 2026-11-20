@@ -78,6 +78,12 @@ What lives here, and why in one place
   under the output root, written through write_guard.py: an existing
   file is never changed, replaced, moved or deleted, and a script stops if
   an output already exists.
+- The possible-mimic pairs of the AID condition analyses (a condition and a
+  core feature it has been reported to produce on its own) and their
+  cumulative sets, and the IPW contrasts of AID+ subsets: the female IPW
+  model of the main analysis, the PS model refitted on the patients kept
+  after a removal, the female balance and weight-change summaries, and the
+  rule that keeps the stored weights or uses the refitted ones.
 
 All ages and spans are whole-day differences divided by 365.25. Only
 intervals are used, never calendar dates as such, so the results do not
@@ -1724,3 +1730,202 @@ def aid_condition_population(patients_path, notes_path, mentions_path, condition
     for k in (1, 2, 3, 4):
         pop[f"core_rbd_{k}plus"] = (pop["core_rbd"] >= k).astype(int)
     return pop, cond, units, ceil, strata_diag
+
+
+# =============================================================================
+# AID CONDITION CONCEPTS: POSSIBLE MIMICS
+# =============================================================================
+# Pairs of an autoimmune condition and a core feature it has been reported to
+# produce on its own: (condition unit, feature F / V / P, the set it first
+# enters). narrow: a defined syndrome whose frequency was measured and attributed
+# to the condition in a cohort; wider: a syndrome known only from pooled cases or
+# an association not attributed to the condition; reported: any published report
+# (case reports or small series); check: no reported syndrome, tested because a
+# treatment effect could be documented as the feature (in the all-reported set).
+# The cumulative sets describe how widely the worst-case assumption is applied,
+# not how often the syndromes occur (all are rare).
+AID_MIMIC_PAIRS = [("systemic lupus erythematosus", "V", "narrow"),
+                   ("systemic lupus erythematosus", "F", "narrow"),
+                   ("giant cell arteritis", "V", "narrow"),
+                   ("hashimotos thyroiditis", "V", "wider"),
+                   ("hashimotos thyroiditis", "F", "wider"),
+                   ("multiple sclerosis", "V", "wider"),
+                   ("celiac disease", "P", "reported"), ("multiple sclerosis", "P", "reported"),
+                   ("systemic lupus erythematosus", "P", "reported"),
+                   ("sjogrens syndrome", "P", "reported"), ("graves disease", "P", "reported"),
+                   ("hashimotos thyroiditis", "P", "reported"),
+                   ("pernicious anemia", "V", "reported"), ("sarcoidosis", "V", "reported"),
+                   ("type 1 diabetes", "F", "check")]
+AID_MIMIC_SETS = [("narrow", {"narrow"}), ("wider", {"narrow", "wider"}),
+                  ("all_reported", {"narrow", "wider", "reported", "check"})]
+
+
+def aid_mimic_set_conditions(tiers, units):
+    """The condition units of the possible-mimic pairs in `tiers` that are analysis
+    units (sorted)."""
+    return sorted({c for c, _, t in AID_MIMIC_PAIRS if t in tiers and c in units})
+
+
+# =============================================================================
+# IPW CONTRASTS OF AID+ SUBSETS (female patients)
+# =============================================================================
+# A comparison of AID+ with AID- patients, including an AID+ subset defined by
+# removing patients, uses the inverse-probability-weighted model of the main
+# analysis: female patients, y ~ aid_status + age_at_dx, binomial GLM (Poisson
+# for a count) with var_weights = the trimmed PS weight and the HC0 variance; the
+# AID odds ratio (rate ratio). Gate: model_floor_reason (2 terms).
+# After patients are removed the weights are either reused (the stored weights of
+# the kept patients) or refitted (the PS model of propensity_score.py on the kept
+# patients, both sexes: fit, stabilize with the kept sample's marginal P(AID+),
+# clip at its pooled 1st and 99th percentiles). Rule: reuse when, among the kept
+# females, the 95th percentile of |log(refit / reuse)| is below log(1.02) and
+# every female PS-covariate weighted SMD under reuse is below 0.10 in absolute
+# value; otherwise refit. Both designs are computed; the rule selects one.
+IPW_WEIGHT_COLUMN = "ps_weight_trimmed"
+IPW_PS_FORMULA = "aid_status ~ (age_at_entry + log_note_count_predx) * female"
+IPW_PS_TRIM_PCT = 1
+IPW_PS_COVARIATES = ["age_at_entry", "log_note_count_predx"]
+IPW_RULE_MAX_P95_ABS_LOG_RATIO = float(np.log(1.02))
+IPW_RULE_MAX_SMD = 0.10
+# (variable, label, role) of the female balance rows
+IPW_BALANCE_ROWS = [("age_at_entry", "Age at first note", "PS covariate"),
+                    ("log_note_count_predx", "Log pre-diagnosis note count", "PS covariate"),
+                    ("age_at_dx", "Age at AD diagnosis", "balance check"),
+                    ("log_note_count", "Log total note count", "balance check"),
+                    ("documentation_span_yrs", "Documentation span", "balance check")]
+
+
+def add_ps_model_columns(pop):
+    """The log note counts of the PS model and the balance rows (log1p of the
+    pre-diagnosis and total note counts). Raises on a population patient without
+    a PS covariate or an age at AD diagnosis."""
+    pop = pop.copy()
+    pop["log_note_count_predx"] = np.log1p(pop["note_count_predx"])
+    pop["log_note_count"] = np.log1p(pop["note_count"])
+    for c in IPW_PS_COVARIATES + ["age_at_dx"]:
+        if pop[c].isna().any():
+            raise ValueError(f"{int(pop[c].isna().sum()):,} population patients without {c}")
+    return pop
+
+
+def refit_ps_weights(d):
+    """The PS model of propensity_score.py refitted on the patients in d (both
+    sexes): fit, stabilize, trim. Returns the weights (Series on d.index)."""
+    import statsmodels.formula.api as smf
+    m = smf.logit(IPW_PS_FORMULA, data=d[["aid_status", "age_at_entry",
+                                          "log_note_count_predx", "female"]]).fit(disp=0)
+    if not m.converged:
+        raise RuntimeError("PS refit did not converge")
+    ps = m.predict(d)
+    p1 = d["aid_status"].mean()
+    w = pd.Series(np.where(d["aid_status"] == 1, p1 / ps, (1 - p1) / (1 - ps)), index=d.index)
+    lo, hi = w.quantile(IPW_PS_TRIM_PCT / 100.0), w.quantile(1 - IPW_PS_TRIM_PCT / 100.0)
+    return w.clip(lower=lo, upper=hi)
+
+
+def ipw_female_fit(d, y, w, model="logit"):
+    """Weighted AID contrast in the female patients d with weights w: the odds
+    ratio (model "logit") or rate ratio ("poisson") of aid_status, adjusted for
+    age_at_dx. Returns events per AID group, status, reason, coef, se, estimate,
+    ci_low, ci_high, p."""
+    import statsmodels.api as sm
+    from scipy.stats import norm
+    nan = float("nan")
+    gate_y = (d[y] > 0).astype(int) if model == "poisson" else d[y].astype(int)
+    out = {"events_aid_pos": float(d.loc[d["aid_status"] == 1, y].sum()),
+           "events_aid_neg": float(d.loc[d["aid_status"] == 0, y].sum()),
+           "status": "", "reason": "", "coef": nan, "se": nan, "estimate": nan,
+           "ci_low": nan, "ci_high": nan, "p": nan}
+    why = model_floor_reason(gate_y, d["aid_status"], 2)
+    if why:
+        out.update(status="not_fitted", reason=why)
+        return out
+    fam = sm.families.Binomial() if model == "logit" else sm.families.Poisson()
+    X = sm.add_constant(d[["aid_status", "age_at_dx"]].astype(float))
+    try:
+        m = sm.GLM(d[y].astype(float), X, family=fam, var_weights=np.asarray(w, float)) \
+            .fit(cov_type="HC0")
+    except Exception as e:
+        out.update(status="failed", reason=f"fit error: {type(e).__name__}")
+        return out
+    crit = float(norm.ppf(0.975))
+    b, s = float(m.params["aid_status"]), float(m.bse["aid_status"])
+    out.update(status="fitted", coef=b, se=s, estimate=float(np.exp(b)),
+               ci_low=float(np.exp(b - crit * s)), ci_high=float(np.exp(b + crit * s)),
+               p=float(2 * norm.sf(abs(b / s))))
+    return out
+
+
+def ipw_balance(d, w):
+    """Female SMDs, unweighted and weighted by w, of the IPW_BALANCE_ROWS variables."""
+    dd = d.assign(_w=np.asarray(w, float))
+    return [{"variable": v, "row_label": lbl, "role": role,
+             "smd_unweighted": smd(dd[v], dd["aid_status"]),
+             "smd_weighted": smd_weighted(dd, v, weight_col="_w")}
+            for v, lbl, role in IPW_BALANCE_ROWS]
+
+
+def ipw_max_ps_smd(bal):
+    """The largest absolute weighted SMD over the PS covariates in ipw_balance rows."""
+    return float(max(abs(b["smd_weighted"]) for b in bal if b["variable"] in IPW_PS_COVARIATES))
+
+
+def ipw_weight_change(d, w_reuse, w_refit):
+    """refit / reuse among the kept females d (median and 95th percentile of
+    |log ratio|, range, correlation) and the effective sample size per AID
+    group under each design."""
+    r = np.asarray(w_refit, float) / np.asarray(w_reuse, float)
+    lr = np.abs(np.log(r))
+    out = {"median_abs_log_ratio": float(np.median(lr)),
+           "p95_abs_log_ratio": float(np.percentile(lr, 95)),
+           "min_ratio": float(r.min()), "max_ratio": float(r.max()),
+           "corr": float(np.corrcoef(w_reuse, w_refit)[0, 1])}
+    for a, tag in ((1, "aid_pos"), (0, "aid_neg")):
+        m = (d["aid_status"] == a).to_numpy()
+        out[f"n_{tag}"] = int(m.sum())
+        out[f"ess_{tag}_reuse"] = effective_sample_size(np.asarray(w_reuse)[m])
+        out[f"ess_{tag}_refit"] = effective_sample_size(np.asarray(w_refit)[m])
+    return out
+
+
+def ipw_weights_rule(wc, bal_reuse):
+    """The weights rule: ("reuse", reason) when the weights move by less than 2%
+    at the 95th percentile and every female PS-covariate weighted SMD under
+    reuse is below IPW_RULE_MAX_SMD; otherwise ("refit", reason)."""
+    move_ok = wc["p95_abs_log_ratio"] < IPW_RULE_MAX_P95_ABS_LOG_RATIO
+    s = ipw_max_ps_smd(bal_reuse)
+    smd_ok = s < IPW_RULE_MAX_SMD
+    if move_ok and smd_ok:
+        return "reuse", (f"95th pct |log ratio| {wc['p95_abs_log_ratio']:.4f} < "
+                         f"{IPW_RULE_MAX_P95_ABS_LOG_RATIO:.4f}; max PS-covariate SMD (reuse) "
+                         f"{s:.3f} < {IPW_RULE_MAX_SMD:g}")
+    why = []
+    if not move_ok:
+        why.append(f"95th pct |log ratio| {wc['p95_abs_log_ratio']:.4f} >= "
+                   f"{IPW_RULE_MAX_P95_ABS_LOG_RATIO:.4f}")
+    if not smd_ok:
+        why.append(f"max PS-covariate SMD (reuse) {s:.3f} >= {IPW_RULE_MAX_SMD:g}")
+    return "refit", "; ".join(why)
+
+
+def ipw_removal_fits(pop, keep, outcomes):
+    """Female IPW models on the kept patients (keep: boolean over pop) with reused
+    and refitted weights, and the rule's choice. outcomes: [(column, label,
+    model)]. Returns a dict: fits[(design, column)], balance[design],
+    weight_change, design, reason, removed (n_removed_<sex>_<AID group>) and
+    kept_female (the kept female patients)."""
+    d = pop[keep]
+    w_reuse, w_refit = d[IPW_WEIGHT_COLUMN], refit_ps_weights(d)
+    rem = pop[~keep]
+    removed = {f"n_removed_{s}_{a}": int(((rem["female"] == sv) & (rem["aid_status"] == av)).sum())
+               for s, sv in (("female", 1), ("male", 0))
+               for a, av in (("aid_pos", 1), ("aid_neg", 0))}
+    f = d["female"] == 1
+    df_, wr, wf = d[f], w_reuse[f], w_refit[f]
+    fits = {(design, y): ipw_female_fit(df_, y, w, model)
+            for design, w in (("reuse", wr), ("refit", wf)) for y, _, model in outcomes}
+    bal = {"reuse": ipw_balance(df_, wr), "refit": ipw_balance(df_, wf)}
+    wc = ipw_weight_change(df_, wr, wf)
+    design, reason = ipw_weights_rule(wc, bal["reuse"])
+    return {"fits": fits, "balance": bal, "weight_change": wc, "design": design,
+            "reason": reason, "removed": removed, "kept_female": df_}
